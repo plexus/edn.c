@@ -285,6 +285,65 @@ Module.onRuntimeInitialized = () => {
     const finalCount = Module.ccall("wasm_edn_reader_count", "number", [], []);
     console.log(`  Readers remaining: ${finalCount}`);
 
+    // =========================================================================
+    // EDN Serialization (Writing)
+    // =========================================================================
+    console.log("\n" + "=".repeat(70));
+    console.log("EDN Serialization (Writing)");
+    console.log("=".repeat(70));
+
+    // Serialize a JS value to an EDN string via the streaming emitter.
+    const writeEdn = (jsValue, { indent = 0, escapeUnicode = 0, newlineAtEnd = 0 } = {}) => {
+        const handle = Module.Emval.toHandle(jsValue);
+        const resultHandle = Module.ccall(
+            "wasm_edn_write_js",
+            "number",
+            ["number", "number", "number", "number"],
+            [handle, indent, escapeUnicode, newlineAtEnd],
+        );
+        const result = Module.Emval.toValue(resultHandle);
+        return result;
+    };
+
+    // Round-trip: parse EDN -> JS value -> serialize back to EDN.
+    console.log("\n🔁 Round-trip (parse then serialize):");
+    const roundTripEDN = '{:user {:name "Bob" :scores [95 87 92]} :active true}';
+    const parsedHandle = Module.ccall(
+        "wasm_edn_parse_to_js",
+        "number",
+        ["string"],
+        [roundTripEDN],
+    );
+    const parsedValue = Module.Emval.toValue(parsedHandle);
+    console.log(`  Original EDN: ${roundTripEDN}`);
+    console.log(`  Compact:      ${writeEdn(parsedValue, { indent: 0 })}`);
+    console.log("  Pretty:");
+    console.log(
+        writeEdn(parsedValue, { indent: 1 })
+            .split("\n")
+            .map((line) => "    " + line)
+            .join("\n"),
+    );
+
+    // Serialize a plain JS object (keys become keywords when valid).
+    console.log("\n📝 Plain object -> EDN:");
+    const plainObject = { name: "Alice", age: 30, tags: ["a", "b"] };
+    console.log(`  JS:  ${JSON.stringify(plainObject)}`);
+    console.log(`  EDN: ${writeEdn(plainObject)}`);
+
+    // Serialize a JS Map (preserves arbitrary key types).
+    console.log("\n📝 Map -> EDN:");
+    const jsMap = new Map([
+        [Symbol.for(":id"), 1],
+        [Symbol.for(":label"), "widget"],
+    ]);
+    console.log(`  EDN: ${writeEdn(jsMap)}`);
+
+    // Serialize a JS Set.
+    console.log("\n📝 Set -> EDN:");
+    const jsSet = new Set([1, 2, 3]);
+    console.log(`  EDN: ${writeEdn(jsSet)}`);
+
     console.log("\n✅ All examples completed!\n");
 };
 

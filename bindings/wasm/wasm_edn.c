@@ -7,6 +7,7 @@
  */
 
 #include <emscripten/emscripten.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -959,4 +960,415 @@ int wasm_edn_parse_to_js_with_readers(const char* input, int default_mode) {
     edn_free(value);
 
     return js_value;
+}
+
+/*
+ * ============================================================================
+ * EDN Serialization (Writing)
+ * ============================================================================
+ *
+ * This section provides the inverse of the JavaScript conversion above:
+ *   - wasm_edn_write       : serialize a value-tree pointer to an EDN string
+ *   - wasm_edn_free_string : free a string returned by wasm_edn_write
+ *   - wasm_edn_write_js    : serialize a JavaScript value directly to EDN using
+ *                            the streaming emitter (no intermediate tree)
+ *
+ * JS -> EDN type mapping (inverse of edn_to_js_internal):
+ *   null / undefined          -> nil
+ *   boolean                   -> boolean
+ *   number (safe integer)     -> integer
+ *   number (other)            -> float
+ *   bigint                    -> bigint (or integer when no Clojure extension)
+ *   string                    -> string
+ *   symbol (":..." desc)      -> keyword (with optional ns/name split)
+ *   symbol (other desc)       -> symbol  (with optional ns/name split)
+ *   Array                     -> vector
+ *   Map                       -> map
+ *   Set                       -> set
+ *   {tag: string, value: any} -> tagged literal
+ *   plain object              -> map (keys become keywords when valid, else strings)
+ */
+
+/* Growable heap buffer feeding the streaming emitter callback. */
+typedef struct {
+    char* data;
+    size_t len;
+    size_t cap;
+    int failed;
+} wasm_write_buffer_t;
+
+static int wasm_write_buffer_cb(const char* buf, size_t len, void* ctx) {
+    wasm_write_buffer_t* b = (wasm_write_buffer_t*) ctx;
+    if (b->failed) {
+        return -1;
+    }
+    if (b->len + len + 1 > b->cap) {
+        size_t new_cap = b->cap ? b->cap : 256;
+        while (new_cap < b->len + len + 1) {
+            new_cap *= 2;
+        }
+        char* new_data = realloc(b->data, new_cap);
+        if (!new_data) {
+            b->failed = 1;
+            return -1;
+        }
+        b->data = new_data;
+        b->cap = new_cap;
+    }
+    memcpy(b->data + b->len, buf, len);
+    b->len += len;
+    b->data[b->len] = '\0';
+    return 0;
+}
+
+/* Copy a JS string handle into a malloc'd UTF-8 buffer; caller frees with free(). */
+static char* js_string_to_utf8(int handle, size_t* out_len) {
+    size_t len = 0;
+    // clang-format off
+    char* ptr = (char*) EM_ASM_PTR({
+        const s = Emval.toValue($0);
+        const n = lengthBytesUTF8(s);
+        const p = _malloc(n + 1);
+        stringToUTF8(s, p, n + 1);
+        setValue($1, n, 'i32');
+        return p;
+    }, handle, &len);
+    // clang-format on
+    if (out_len) {
+        *out_len = len;
+    }
+    return ptr;
+}
+
+static int js_array_length(int arr_handle) {
+    return EM_ASM_INT({ return Emval.toValue($0).length; }, arr_handle);
+}
+
+/* Returns a fresh Emval handle for arr[i]; caller decrefs. */
+static int js_array_get(int arr_handle, int i) {
+    return EM_ASM_INT({ return Emval.toHandle(Emval.toValue($0)[$1]); }, arr_handle, i);
+}
+
+/* Emit a (possibly namespaced) keyword or symbol from a single name string. */
+static int emit_qualified(edn_emitter_t* em, const char* name, bool keyword) {
+    const char* slash = strchr(name, '/');
+    bool single = slash && strchr(slash + 1, '/') == NULL && slash != name && slash[1] != '\0';
+    if (single) {
+        size_t ns_len = (size_t) (slash - name);
+        char* ns = malloc(ns_len + 1);
+        if (!ns) {
+            return -EDN_ERROR_OUT_OF_MEMORY;
+        }
+        memcpy(ns, name, ns_len);
+        ns[ns_len] = '\0';
+        int rc = keyword ? edn_emit_keyword_ns(em, ns, slash + 1)
+                         : edn_emit_symbol_ns(em, ns, slash + 1);
+        free(ns);
+        return rc;
+    }
+    return keyword ? edn_emit_keyword(em, name) : edn_emit_symbol(em, name);
+}
+
+/* Recursively emit a JS value through the streaming emitter. Returns 0 / -EDN_ERROR_*. */
+static int js_to_edn_emit(int handle, edn_emitter_t* em) {
+    // clang-format off
+    int type_code = EM_ASM_INT({
+        const v = Emval.toValue($0);
+        if (v === null || v === undefined) return 0;
+        const t = typeof v;
+        if (t === 'boolean') return 1;
+        if (t === 'number') return 2;
+        if (t === 'bigint') return 3;
+        if (t === 'string') return 4;
+        if (t === 'symbol') return 5;
+        if (Array.isArray(v)) return 6;
+        if (v instanceof Map) return 7;
+        if (v instanceof Set) return 8;
+        if (t === 'object') {
+            if (typeof v.tag === 'string' && ('value' in v) && Object.keys(v).length === 2) {
+                return 9;
+            }
+            return 10;
+        }
+        return -1;
+    }, handle);
+
+    switch (type_code) {
+        case 0:
+            return edn_emit_nil(em);
+
+        case 1: {
+            int b = EM_ASM_INT({ return !!Emval.toValue($0); }, handle);
+            return edn_emit_bool(em, b != 0);
+        }
+
+        case 2: {
+            double d = EM_ASM_DOUBLE({ return Emval.toValue($0); }, handle);
+            int is_int = EM_ASM_INT(
+                {
+                    const v = Emval.toValue($0);
+                    return (Number.isInteger(v) && Math.abs(v) <= 9007199254740991) ? 1 : 0;
+                },
+                handle);
+            return is_int ? edn_emit_int(em, (int64_t) d) : edn_emit_double(em, d);
+        }
+
+        case 3: {
+            int str_handle =
+                EM_ASM_INT({ return Emval.toHandle(Emval.toValue($0).toString()); }, handle);
+            size_t dlen = 0;
+            char* digits = js_string_to_utf8(str_handle, &dlen);
+            _emval_decref(str_handle);
+            if (!digits) {
+                return -EDN_ERROR_OUT_OF_MEMORY;
+            }
+            int rc;
+#ifdef EDN_ENABLE_CLOJURE_EXTENSION
+            rc = edn_emit_bigint(em, digits, 10);
+#else
+            errno = 0;
+            char* endp = NULL;
+            long long v = strtoll(digits, &endp, 10);
+            if (errno == 0 && endp && *endp == '\0' && endp != digits) {
+                rc = edn_emit_int(em, (int64_t) v);
+            } else {
+                rc = -EDN_ERROR_UNSUPPORTED_TYPE;
+            }
+#endif
+            free(digits);
+            return rc;
+        }
+
+        case 4: {
+            size_t slen = 0;
+            char* s = js_string_to_utf8(handle, &slen);
+            if (!s) {
+                return -EDN_ERROR_OUT_OF_MEMORY;
+            }
+            int rc = edn_emit_string(em, s, slen);
+            free(s);
+            return rc;
+        }
+
+        case 5: {
+            int desc_handle = EM_ASM_INT(
+                {
+                    const d = Emval.toValue($0).description;
+                    return Emval.toHandle(typeof d === 'string' ? d : '');
+                },
+                handle);
+            size_t dlen = 0;
+            char* desc = js_string_to_utf8(desc_handle, &dlen);
+            _emval_decref(desc_handle);
+            if (!desc) {
+                return -EDN_ERROR_OUT_OF_MEMORY;
+            }
+            bool keyword = desc[0] == ':';
+            int rc = emit_qualified(em, keyword ? desc + 1 : desc, keyword);
+            free(desc);
+            return rc;
+        }
+
+        case 6: {
+            int n = js_array_length(handle);
+            int rc = edn_emit_begin_vector(em);
+            for (int i = 0; rc == 0 && i < n; i++) {
+                int elem = js_array_get(handle, i);
+                rc = js_to_edn_emit(elem, em);
+                _emval_decref(elem);
+            }
+            return rc == 0 ? edn_emit_end_vector(em) : rc;
+        }
+
+        case 7: {
+            int entries = EM_ASM_INT(
+                { return Emval.toHandle(Array.from(Emval.toValue($0).entries())); }, handle);
+            int n = js_array_length(entries);
+            int rc = edn_emit_begin_map(em);
+            for (int i = 0; rc == 0 && i < n; i++) {
+                int pair = js_array_get(entries, i);
+                int key = js_array_get(pair, 0);
+                int val = js_array_get(pair, 1);
+                rc = js_to_edn_emit(key, em);
+                if (rc == 0) {
+                    rc = js_to_edn_emit(val, em);
+                }
+                _emval_decref(key);
+                _emval_decref(val);
+                _emval_decref(pair);
+            }
+            _emval_decref(entries);
+            return rc == 0 ? edn_emit_end_map(em) : rc;
+        }
+
+        case 8: {
+            int arr = EM_ASM_INT({ return Emval.toHandle(Array.from(Emval.toValue($0))); }, handle);
+            int n = js_array_length(arr);
+            int rc = edn_emit_begin_set(em);
+            for (int i = 0; rc == 0 && i < n; i++) {
+                int elem = js_array_get(arr, i);
+                rc = js_to_edn_emit(elem, em);
+                _emval_decref(elem);
+            }
+            _emval_decref(arr);
+            return rc == 0 ? edn_emit_end_set(em) : rc;
+        }
+
+        case 9: {
+            int tag_handle = EM_ASM_INT({ return Emval.toHandle(Emval.toValue($0).tag); }, handle);
+            size_t tlen = 0;
+            char* tag = js_string_to_utf8(tag_handle, &tlen);
+            _emval_decref(tag_handle);
+            if (!tag) {
+                return -EDN_ERROR_OUT_OF_MEMORY;
+            }
+            int rc = edn_emit_tag(em, tag);
+            free(tag);
+            if (rc != 0) {
+                return rc;
+            }
+            int val = EM_ASM_INT({ return Emval.toHandle(Emval.toValue($0).value); }, handle);
+            rc = js_to_edn_emit(val, em);
+            _emval_decref(val);
+            return rc;
+        }
+
+        case 10: {
+            int keys =
+                EM_ASM_INT({ return Emval.toHandle(Object.keys(Emval.toValue($0))); }, handle);
+            int n = js_array_length(keys);
+            int rc = edn_emit_begin_map(em);
+            for (int i = 0; rc == 0 && i < n; i++) {
+                int key_handle = js_array_get(keys, i);
+                size_t klen = 0;
+                char* key = js_string_to_utf8(key_handle, &klen);
+                if (!key) {
+                    _emval_decref(key_handle);
+                    rc = -EDN_ERROR_OUT_OF_MEMORY;
+                    break;
+                }
+                /* Conservatively decide if the key is a valid EDN keyword name.
+                 * NOTE: avoid backslash escapes in this regex literal; EM_ASM
+                 * stringization strips backslashes, so use explicit char ranges
+                 * (\w -> A-Za-z0-9_) and place '-' at the end of each class. */
+                int is_kw = EM_ASM_INT(
+                    {
+                        const k = UTF8ToString($0);
+                        const re = /^[A-Za-z*!_?$%&=<>+.-][A-Za-z0-9_*!?$%&=<>+.:#'-]*$/;
+                        const parts = k.split('/');
+                        if (parts.length === 1) return re.test(parts[0]) ? 1 : 0;
+                        if (parts.length === 2) {
+                            return (re.test(parts[0]) && re.test(parts[1])) ? 1 : 0;
+                        }
+                        return 0;
+                    },
+                    key);
+                if (is_kw) {
+                    rc = emit_qualified(em, key, true);
+                } else {
+                    rc = edn_emit_string(em, key, klen);
+                }
+                free(key);
+                if (rc == 0) {
+                    int val_handle = EM_ASM_INT(
+                        {
+                            const obj = Emval.toValue($0);
+                            const k = Emval.toValue($1);
+                            return Emval.toHandle(obj[k]);
+                        },
+                        handle, key_handle);
+                    rc = js_to_edn_emit(val_handle, em);
+                    _emval_decref(val_handle);
+                }
+                _emval_decref(key_handle);
+            }
+            _emval_decref(keys);
+            return rc == 0 ? edn_emit_end_map(em) : rc;
+        }
+
+        default:
+            return -EDN_ERROR_UNSUPPORTED_TYPE;
+    }
+    // clang-format on
+}
+
+/**
+ * Serialize an EDN value-tree to a malloc'd EDN string.
+ *
+ * @param value         EDN value pointer
+ * @param indent        0 = compact, non-zero = pretty-print
+ * @param sort_unordered non-zero to sort map/set entries deterministically
+ * @param escape_unicode non-zero to escape non-ASCII as \uXXXX
+ * @param newline_at_end non-zero to append a trailing newline
+ * @return malloc'd null-terminated string (free via wasm_edn_free_string), NULL on error
+ */
+EMSCRIPTEN_KEEPALIVE
+char* wasm_edn_write(edn_value_t* value, int indent, int sort_unordered, int escape_unicode,
+                     int newline_at_end) {
+    if (!value) {
+        return NULL;
+    }
+
+    edn_write_options_t opts = {0};
+    opts.struct_size = sizeof(edn_write_options_t);
+    opts.indent = (size_t) indent;
+    opts.sort_unordered = sort_unordered != 0;
+    opts.escape_unicode = escape_unicode != 0;
+    opts.newline_at_end = newline_at_end != 0;
+
+    return edn_write_string(value, &opts, NULL);
+}
+
+/**
+ * Free a string previously returned by wasm_edn_write. NULL-safe.
+ */
+EMSCRIPTEN_KEEPALIVE
+void wasm_edn_free_string(char* s) {
+    free(s);
+}
+
+/**
+ * Serialize a JavaScript value directly to an EDN string using the streaming
+ * emitter (no intermediate value-tree is built).
+ *
+ * @param js_handle      Emval handle to the JavaScript value
+ * @param indent         0 = compact, non-zero = pretty-print
+ * @param escape_unicode non-zero to escape non-ASCII as \uXXXX
+ * @param newline_at_end non-zero to append a trailing newline
+ * @return Emval handle to a JS string with the EDN serialization, or to null on error
+ */
+EMSCRIPTEN_KEEPALIVE
+int wasm_edn_write_js(int js_handle, int indent, int escape_unicode, int newline_at_end) {
+    int null_handle = EM_ASM_INT({ return Emval.toHandle(null); });
+
+    edn_write_options_t opts = {0};
+    opts.struct_size = sizeof(edn_write_options_t);
+    opts.indent = (size_t) indent;
+    opts.escape_unicode = escape_unicode != 0;
+    opts.newline_at_end = newline_at_end != 0;
+
+    wasm_write_buffer_t buf = {0};
+    edn_emitter_t* em = edn_emitter_create(wasm_write_buffer_cb, &buf, &opts);
+    if (!em) {
+        free(buf.data);
+        return null_handle;
+    }
+
+    int rc = js_to_edn_emit(js_handle, em);
+    if (rc == 0) {
+        rc = edn_emitter_finish(em);
+    }
+    edn_emitter_destroy(em);
+
+    int result;
+    if (rc == 0 && !buf.failed && buf.data) {
+        result =
+            EM_ASM_INT({ return Emval.toHandle(UTF8ToString($0, $1)); }, buf.data, (int) buf.len);
+        _emval_decref(null_handle);
+    } else {
+        result = null_handle;
+    }
+
+    free(buf.data);
+    return result;
 }
