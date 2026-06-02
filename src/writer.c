@@ -107,7 +107,7 @@ static int emit_float(emit_ctx_t* e, double d) {
         p++;
     }
 
-    char digits[32];
+    char digits[32] = {0};
     int k = 0;
     while (*p && *p != 'E') {
         if (*p != '.') {

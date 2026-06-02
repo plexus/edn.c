@@ -9,6 +9,11 @@
  *   echo '{:a 1}' | edn_cli  # Parse from stdin
  */
 
+/* Expose POSIX functions (e.g. fileno) under -std=c11 on glibc/Linux. */
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,22 +61,9 @@ static void print_nil(const print_options_t* opts) {
 
 /* Print boolean */
 static void print_bool(const edn_value_t* value, const print_options_t* opts) {
-    /* Access internal structure - bool is stored in value->as.boolean */
-    /* This is a workaround until edn_bool_get() is added to public API */
-    struct edn_value_internal {
-        edn_type_t type;
-        uint64_t cached_hash;
-#ifdef EDN_ENABLE_CLOJURE_EXTENSION
-        edn_value_t* metadata;
-#endif
-        union {
-            bool boolean;
-            /* ... other fields ... */
-        } as;
-    };
-
-    const struct edn_value_internal* internal = (const struct edn_value_internal*) value;
-    bool val = internal->as.boolean;
+    bool val;
+    if (!edn_bool_get(value, &val))
+        return;
 
     if (opts->use_colors)
         printf("%s", COLOR_BOOL);

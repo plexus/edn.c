@@ -15,6 +15,11 @@
  *   echo '{:a 1}' | edn_tui  # Read from pipe
  */
 
+/* Expose POSIX/legacy functions (e.g. usleep) under -std=c11 on glibc/Linux. */
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
 #include <ctype.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -527,13 +532,19 @@ static void render_value(edn_value_t* val, char* buf, size_t bufsize, bool colla
                     /* For non-collections, show the full tagged literal */
                     char wrapped_str[256];
                     render_value(wrapped, wrapped_str, sizeof(wrapped_str), false);
-                    snprintf(buf, bufsize, "#%.*s %s", (int) tag_len, tag, wrapped_str);
+                    int avail = (int) bufsize - (int) tag_len - 3;
+                    if (avail < 0)
+                        avail = 0;
+                    snprintf(buf, bufsize, "#%.*s %.*s", (int) tag_len, tag, avail, wrapped_str);
                 }
             } else {
                 /* When not collapsed (inline display like map keys), show full tagged literal */
                 char wrapped_str[256];
                 render_value(wrapped, wrapped_str, sizeof(wrapped_str), false);
-                snprintf(buf, bufsize, "#%.*s %s", (int) tag_len, tag, wrapped_str);
+                int avail = (int) bufsize - (int) tag_len - 3;
+                if (avail < 0)
+                    avail = 0;
+                snprintf(buf, bufsize, "#%.*s %.*s", (int) tag_len, tag, avail, wrapped_str);
             }
             break;
         }
